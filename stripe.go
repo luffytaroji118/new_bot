@@ -1197,6 +1197,12 @@ func runStripeGateSession(bot *tele.Bot, chat *tele.Chat, sess *CheckSession, pr
 	if workers > 30 {
 		workers = 30
 	}
+	if sess.GatewayName == "Razorpay" {
+		workers = max(len(proxies)*10, 15)
+		if workers > 30 {
+			workers = 30
+		}
+	}
 	sem := make(chan struct{}, workers)
 	var proxyIdx atomic.Int64
 	var wg sync.WaitGroup

