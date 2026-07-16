@@ -81,6 +81,9 @@ func handle3DSRedirect(redirectURL, proxyURL string) *razorpay3DSResult {
 			idx := (startIdx + i) % len(solverURLs)
 			result, busy := solveViaHTTP(solverURLs[idx], redirectURL, "")
 			if result != nil {
+				if result.PageText == "" && !result.PageClosedEarly && !result.Charged {
+					continue
+				}
 				return result
 			}
 			if !busy {
@@ -108,7 +111,7 @@ func solveViaHTTP(solverURL, redirectURL, proxyURL string) (*razorpay3DSResult, 
 
 	solveEndpoint := strings.TrimRight(solverURL, "/") + "/solve"
 
-	client := &http.Client{Timeout: 18 * time.Second}
+	client := &http.Client{Timeout: 45 * time.Second}
 	req, err := http.NewRequest("POST", solveEndpoint, bytes.NewReader(jsonBody))
 	if err != nil {
 		fmt.Printf("[RAZ] solver %s req error: %v\n", solverURL, err)
@@ -191,7 +194,7 @@ func solveLocal(redirectURL, proxyURL string) *razorpay3DSResult {
 	defer cancel()
 
 	// Set a hard timeout for the whole browser session
-	browserCtx, cancelBrowser := context.WithTimeout(allocCtx, 25*time.Second)
+	browserCtx, cancelBrowser := context.WithTimeout(allocCtx, 40*time.Second)
 	defer cancelBrowser()
 
 	taskCtx, cancelTask := chromedp.NewContext(browserCtx)
@@ -224,18 +227,18 @@ func solveLocal(redirectURL, proxyURL string) *razorpay3DSResult {
 		)
 	}
 
-	// Wait for the bank page to process (TDS_WAIT_SECONDS = 10 in Python)
-	// The page may auto-redirect, auto-submit, or show an OTP form.
+	// Wait for the bank page to process 3DS.
 	// Frictionless 3DS will auto-redirect back to Razorpay with a signature.
-	waitCtx, cancelWait := context.WithTimeout(taskCtx, 12*time.Second)
+	// Challenge 3DS will show an OTP form (we can't complete it).
+	waitCtx, cancelWait := context.WithTimeout(taskCtx, 37*time.Second)
 	defer cancelWait()
 
 	_ = chromedp.Run(waitCtx,
 		chromedp.ActionFunc(func(ctx context.Context) error {
-			// Wait for either:
-			// 1. The page to change URL (redirect back to Razorpay)
-			// 2. A timeout (bank page is showing OTP input)
-			deadline := time.Now().Add(10 * time.Second)
+			deadline := time.Now().Add(36 * time.Second)
+			leftPgRouter := false
+			leftPgRouterTime := time.Time{}
+
 			for time.Now().Before(deadline) {
 				select {
 				case <-ctx.Done():
@@ -243,23 +246,58 @@ func solveLocal(redirectURL, proxyURL string) *razorpay3DSResult {
 				default:
 				}
 
-				// Check current URL
 				var currentURL string
 				_ = chromedp.Run(ctx, chromedp.Location(&currentURL))
 
-				// If redirected away from pg_router, the bank processed it
-				if !strings.Contains(currentURL, "pg_router") && !strings.Contains(currentURL, "authenticate") {
-					// Redirected to Razorpay callback — check page text
-					time.Sleep(500 * time.Millisecond)
-					var pageText string
-					_ = chromedp.Run(ctx, chromedp.Text("body", &pageText, chromedp.ByQuery))
-					result.PageText = strings.TrimSpace(pageText)
-					if strings.Contains(strings.ToLower(pageText), "razorpay_signature") ||
-						strings.Contains(strings.ToLower(pageText), "payment successful") ||
-						strings.Contains(strings.ToLower(pageText), "payment_success") {
+				var pageText string
+				_ = chromedp.Run(ctx, chromedp.Text("body", &pageText, chromedp.ByQuery))
+				pageText = strings.TrimSpace(pageText)
+				lowerText := strings.ToLower(pageText)
+
+				if pageText != "" {
+					if strings.Contains(lowerText, "razorpay_signature") ||
+						strings.Contains(lowerText, "payment successful") ||
+						strings.Contains(lowerText, "payment_success") ||
+						strings.Contains(lowerText, "payment succeeded") ||
+						strings.Contains(lowerText, "payment_done") {
 						result.Charged = true
+						result.PageText = pageText
+						if len(result.PageText) > 300 {
+							result.PageText = result.PageText[:300]
+						}
+						return nil
 					}
-					return nil
+					if strings.Contains(lowerText, "payment") && strings.Contains(lowerText, "failed") {
+						result.PageText = pageText
+						if len(result.PageText) > 300 {
+							result.PageText = result.PageText[:300]
+						}
+						return nil
+					}
+					if strings.Contains(lowerText, "transaction failed") ||
+						strings.Contains(lowerText, "authentication failed") ||
+						strings.Contains(lowerText, "access denied") {
+						result.PageText = pageText
+						if len(result.PageText) > 300 {
+							result.PageText = result.PageText[:300]
+						}
+						return nil
+					}
+				}
+
+				onPgRouter := strings.Contains(currentURL, "pg_router") || strings.Contains(currentURL, "authenticate")
+				if !onPgRouter && pageText != "" {
+					if !leftPgRouter {
+						leftPgRouter = true
+						leftPgRouterTime = time.Now()
+					}
+					if time.Since(leftPgRouterTime) > 3*time.Second {
+						result.PageText = pageText
+						if len(result.PageText) > 300 {
+							result.PageText = result.PageText[:300]
+						}
+						return nil
+					}
 				}
 
 				time.Sleep(500 * time.Millisecond)
