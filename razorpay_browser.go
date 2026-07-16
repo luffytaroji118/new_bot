@@ -74,16 +74,23 @@ func handle3DSRedirect(redirectURL, proxyURL string) *razorpay3DSResult {
 	solverURLs := getSolverURLs()
 
 	if len(solverURLs) > 0 {
-		// Round-robin starting index
 		startIdx := int(atomic.AddUint64(&solverRoundRobin, 1)-1) % len(solverURLs)
+		allBusy := true
 
 		for i := 0; i < len(solverURLs); i++ {
 			idx := (startIdx + i) % len(solverURLs)
-			result := solveViaHTTP(solverURLs[idx], redirectURL, "")
+			result, busy := solveViaHTTP(solverURLs[idx], redirectURL, "")
 			if result != nil {
 				return result
 			}
-			fmt.Printf("[RAZ] solver %s failed, trying next (attempt %d/%d)\n", solverURLs[idx], i+1, len(solverURLs))
+			if !busy {
+				allBusy = false
+			}
+		}
+
+		if allBusy {
+			fmt.Printf("[RAZ] all %d solver(s) busy, skipping 3DS\n", len(solverURLs))
+			return &razorpay3DSResult{}
 		}
 
 		fmt.Printf("[RAZ] all %d solver(s) failed, falling back to local browser\n", len(solverURLs))
@@ -93,43 +100,48 @@ func handle3DSRedirect(redirectURL, proxyURL string) *razorpay3DSResult {
 }
 
 // solveViaHTTP calls the external solver service via HTTP.
-// Returns nil if the solver is unavailable or errors (so caller can try next).
-func solveViaHTTP(solverURL, redirectURL, proxyURL string) *razorpay3DSResult {
+// Returns (result, busy). If busy=true, the solver returned 503 (all slots taken).
+// Returns (nil, false) if the solver had a real error.
+func solveViaHTTP(solverURL, redirectURL, proxyURL string) (*razorpay3DSResult, bool) {
 	reqBody := solverRequest{URL: redirectURL, Proxy: proxyURL}
 	jsonBody, _ := json.Marshal(reqBody)
 
 	solveEndpoint := strings.TrimRight(solverURL, "/") + "/solve"
 
-	client := &http.Client{Timeout: 35 * time.Second}
+	client := &http.Client{Timeout: 18 * time.Second}
 	req, err := http.NewRequest("POST", solveEndpoint, bytes.NewReader(jsonBody))
 	if err != nil {
 		fmt.Printf("[RAZ] solver %s req error: %v\n", solverURL, err)
-		return nil
+		return nil, false
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := client.Do(req)
 	if err != nil {
 		fmt.Printf("[RAZ] solver %s HTTP error: %v\n", solverURL, err)
-		return nil
+		return nil, false
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == 503 {
+		return nil, true
+	}
+
 	if resp.StatusCode != 200 {
 		fmt.Printf("[RAZ] solver %s HTTP status: %d\n", solverURL, resp.StatusCode)
-		return nil
+		return nil, false
 	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		fmt.Printf("[RAZ] solver %s read body error: %v\n", solverURL, err)
-		return nil
+		return nil, false
 	}
 
 	var sr solverResponse
 	if err := json.Unmarshal(body, &sr); err != nil {
 		fmt.Printf("[RAZ] solver %s parse error: %v body=%s\n", solverURL, err, string(body))
-		return nil
+		return nil, false
 	}
 
 	result := &razorpay3DSResult{
@@ -147,7 +159,7 @@ func solveViaHTTP(solverURL, redirectURL, proxyURL string) *razorpay3DSResult {
 		fmt.Printf("[RAZ] 3ds solver error=%s\n", sr.Error)
 	}
 
-	return result
+	return result, false
 }
 
 // solveLocal runs a local headless Chrome instance to handle the 3DS redirect.
