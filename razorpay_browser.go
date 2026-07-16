@@ -79,9 +79,13 @@ func handle3DSRedirect(redirectURL, proxyURL string) *razorpay3DSResult {
 
 		for i := 0; i < len(solverURLs); i++ {
 			idx := (startIdx + i) % len(solverURLs)
-			result, busy := solveViaHTTP(solverURLs[idx], redirectURL, "")
+			result, busy := solveViaHTTP(solverURLs[idx], redirectURL, proxyURL)
 			if result != nil {
 				if result.PageText == "" && !result.PageClosedEarly && !result.Charged {
+					continue
+				}
+				if strings.Contains(strings.ToLower(result.PageText), "403 forbidden") {
+					fmt.Printf("[RAZ] solver %s got 403, trying next\n", solverURLs[idx])
 					continue
 				}
 				return result
