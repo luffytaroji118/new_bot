@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -15,7 +16,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	_ "github.com/bdandy/go-socks4"
 	tele "gopkg.in/telebot.v4"
+	"golang.org/x/net/proxy"
 )
 
 // stripeCheckFn is the common signature for all Stripe gate check functions.
@@ -51,23 +54,48 @@ func newHTTPClient(proxyURL string, timeout time.Duration) *http.Client {
 		DisableKeepAlives:   true,
 	}
 	if proxyURL != "" {
-		if parsed, err := url.Parse(proxyURL); err == nil {
-			transport.Proxy = http.ProxyURL(parsed)
-		}
+		applyProxyToTransport(transport, proxyURL)
 	}
 	return &http.Client{Transport: transport, Timeout: timeout}
 }
 
-// newCookieClient returns an http.Client with a cookie jar (for multi-step stateful sessions).
 func newCookieClient(proxyURL string, timeout time.Duration) *http.Client {
 	jar, _ := cookiejar.New(nil)
 	t := &http.Transport{TLSHandshakeTimeout: 10 * time.Second}
 	if proxyURL != "" {
-		if p, err := url.Parse(proxyURL); err == nil {
-			t.Proxy = http.ProxyURL(p)
-		}
+		applyProxyToTransport(t, proxyURL)
 	}
 	return &http.Client{Transport: t, Timeout: timeout, Jar: jar}
+}
+
+func applyProxyToTransport(t *http.Transport, proxyURL string) {
+	parsed, err := url.Parse(proxyURL)
+	if err != nil {
+		return
+	}
+	switch parsed.Scheme {
+	case "socks5", "socks5h":
+		var auth *proxy.Auth
+		if parsed.User != nil {
+			pw, _ := parsed.User.Password()
+			auth = &proxy.Auth{User: parsed.User.Username(), Password: pw}
+		}
+		d, err := proxy.SOCKS5("tcp", parsed.Host, auth, &net.Dialer{Timeout: 10 * time.Second})
+		if err == nil {
+			t.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return d.Dial(network, addr)
+			}
+		}
+	case "socks4", "socks4a":
+		d, err := proxy.FromURL(parsed, &net.Dialer{Timeout: 10 * time.Second})
+		if err == nil {
+			t.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return d.Dial(network, addr)
+			}
+		}
+	default:
+		t.Proxy = http.ProxyURL(parsed)
+	}
 }
 
 // ─────────────── String helpers ─────────────────────────────────────

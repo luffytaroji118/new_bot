@@ -4263,7 +4263,7 @@ bot.Handle("/admin", func(c tele.Context) error {
 			var valid []string
 			for _, p := range ud.Proxies {
 				p = strings.TrimSpace(p)
-				if p != "" && (strings.HasPrefix(p, "http://") || strings.HasPrefix(p, "https://") || strings.HasPrefix(p, "socks5://")) {
+				if p != "" && (strings.HasPrefix(p, "http://") || strings.HasPrefix(p, "https://") || strings.HasPrefix(p, "socks5://") || strings.HasPrefix(p, "socks5h://") || strings.HasPrefix(p, "socks4://") || strings.HasPrefix(p, "socks4a://")) {
 					valid = append(valid, p)
 				} else {
 					cleaned++
