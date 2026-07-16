@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/chromedp/cdproto/network"
@@ -17,9 +18,9 @@ import (
 
 // razorpay3DSResult holds the result of the browser-based 3DS handling.
 type razorpay3DSResult struct {
-	PageText      string
+	PageText        string
 	PageClosedEarly bool
-	Charged       bool
+	Charged         bool
 }
 
 // solverRequest is the JSON body sent to the solver service.
@@ -36,77 +37,109 @@ type solverResponse struct {
 	Error       string `json:"error,omitempty"`
 }
 
+var solverRoundRobin uint64
+
+// getSolverURLs returns the list of solver service URLs from env vars.
+// Supports RAZORPAY_SOLVER_URLS (comma-separated) and RAZORPAY_SOLVER_URL (single).
+func getSolverURLs() []string {
+	var urls []string
+
+	if multi := os.Getenv("RAZORPAY_SOLVER_URLS"); multi != "" {
+		for _, u := range strings.Split(multi, ",") {
+			u = strings.TrimSpace(u)
+			if u != "" {
+				urls = append(urls, u)
+			}
+		}
+	}
+
+	if single := os.Getenv("RAZORPAY_SOLVER_URL"); single != "" {
+		single = strings.TrimSpace(single)
+		if single != "" {
+			urls = append(urls, single)
+		}
+	}
+
+	return urls
+}
+
 // handle3DSRedirect opens the 3DS redirect URL in a headless browser,
 // waits for the bank page to load/process, reads the final page text,
 // and determines if the payment was charged (frictionless 3DS).
 //
-// If RAZORPAY_SOLVER_URL is set, it calls the external solver service.
+// If RAZORPAY_SOLVER_URLS or RAZORPAY_SOLVER_URL is set, it calls the
+// external solver service(s) with round-robin load balancing and failover.
 // Otherwise, it runs a local headless Chrome instance.
 func handle3DSRedirect(redirectURL, proxyURL string) *razorpay3DSResult {
-	// Try external solver service first
-	// Note: proxy is NOT passed to the solver — the solver is on Railway
-	// and can reach Razorpay directly. The bot's proxy format (e.g. socks4)
-	// is often incompatible with Chrome's --proxy-server flag.
-	solverURL := os.Getenv("RAZORPAY_SOLVER_URL")
-	if solverURL != "" {
-		result := solveViaHTTP(solverURL, redirectURL, "")
-		if result != nil {
-			return result
+	solverURLs := getSolverURLs()
+
+	if len(solverURLs) > 0 {
+		// Round-robin starting index
+		startIdx := int(atomic.AddUint64(&solverRoundRobin, 1)-1) % len(solverURLs)
+
+		for i := 0; i < len(solverURLs); i++ {
+			idx := (startIdx + i) % len(solverURLs)
+			result := solveViaHTTP(solverURLs[idx], redirectURL, "")
+			if result != nil {
+				return result
+			}
+			fmt.Printf("[RAZ] solver %s failed, trying next (attempt %d/%d)\n", solverURLs[idx], i+1, len(solverURLs))
 		}
-		// If solver failed, fall through to local browser
-		fmt.Printf("[RAZ] solver service unavailable, falling back to local browser\n")
+
+		fmt.Printf("[RAZ] all %d solver(s) failed, falling back to local browser\n", len(solverURLs))
 	}
 
-	// Fall back to local browser
 	return solveLocal(redirectURL, proxyURL)
 }
 
 // solveViaHTTP calls the external solver service via HTTP.
+// Returns nil if the solver is unavailable or errors (so caller can try next).
 func solveViaHTTP(solverURL, redirectURL, proxyURL string) *razorpay3DSResult {
 	reqBody := solverRequest{URL: redirectURL, Proxy: proxyURL}
 	jsonBody, _ := json.Marshal(reqBody)
 
-	// Ensure the URL has /solve endpoint
 	solveEndpoint := strings.TrimRight(solverURL, "/") + "/solve"
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := &http.Client{Timeout: 35 * time.Second}
 	req, err := http.NewRequest("POST", solveEndpoint, bytes.NewReader(jsonBody))
 	if err != nil {
+		fmt.Printf("[RAZ] solver %s req error: %v\n", solverURL, err)
 		return nil
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := client.Do(req)
 	if err != nil {
-		fmt.Printf("[RAZ] solver HTTP error: %v\n", err)
+		fmt.Printf("[RAZ] solver %s HTTP error: %v\n", solverURL, err)
 		return nil
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		fmt.Printf("[RAZ] solver HTTP status: %d\n", resp.StatusCode)
+		fmt.Printf("[RAZ] solver %s HTTP status: %d\n", solverURL, resp.StatusCode)
 		return nil
 	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		fmt.Printf("[RAZ] solver read body error: %v\n", err)
+		fmt.Printf("[RAZ] solver %s read body error: %v\n", solverURL, err)
 		return nil
 	}
 
 	var sr solverResponse
 	if err := json.Unmarshal(body, &sr); err != nil {
-		fmt.Printf("[RAZ] solver parse error: %v body=%s\n", err, string(body))
+		fmt.Printf("[RAZ] solver %s parse error: %v body=%s\n", solverURL, err, string(body))
 		return nil
 	}
 
 	result := &razorpay3DSResult{
-		PageText:      sr.PageText,
+		PageText:        sr.PageText,
 		PageClosedEarly: sr.ClosedEarly,
-		Charged:       sr.Charged,
+		Charged:         sr.Charged,
 	}
 
-	fmt.Printf("[RAZ] 3ds solver charged=%v closed_early=%v page_text_len=%d\n", result.Charged, result.PageClosedEarly, len(result.PageText))
+	fmt.Printf("[RAZ] 3ds solver=%s charged=%v closed_early=%v page_text_len=%d\n",
+		solverURL, result.Charged, result.PageClosedEarly, len(result.PageText))
 	if result.PageText != "" {
 		fmt.Printf("[RAZ] 3ds solver page_text=%s\n", result.PageText)
 	}
