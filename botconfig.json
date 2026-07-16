@@ -1,0 +1,17 @@
+{
+  "banned_users": {},
+  "allowed_users": {},
+  "pvt_only": false,
+  "blocked_ids": null,
+  "allow_only_ids": null,
+  "restrict_all": false,
+  "groups": null,
+  "groups_only": false,
+  "dynamic_admins": null,
+  "perms": {},
+  "free_mode": false,
+  "daily_limit": 1000,
+  "force_join": null,
+  "force_join_enabled": false,
+  "default_credits": 0
+}

@@ -1,0 +1,48 @@
+{
+  "5733576801": {
+    "proxies": [
+      "http://209741:qH3jnMqF@209.127.15.203:8800",
+      "http://209741:qH3jnMqF@209.127.15.206:8800",
+      "http://209741:qH3jnMqF@209.127.17.195:8800",
+      "http://209741:qH3jnMqF@209.127.17.193:8800",
+      "http://209741:qH3jnMqF@209.127.17.194:8800",
+      "http://209741:qH3jnMqF@209.127.17.196:8800",
+      "http://1316:p8zishJyoWbr@p101.squidproxies.com:9015",
+      "http://1313:kKc8rAqKSya9@p102.squidproxies.com:9012",
+      "http://g2rTXpNfPdcw2fzGtWKp62yH:nizar1elad2@se-kis.pvdata.host:8080",
+      "http://g2rTXpNfPdcw2fzGtWKp62yH:nizar1elad2@tw-tai.pvdata.host:8080",
+      "http://g2rTXpNfPdcw2fzGtWKp62yH:nizar1elad2@kr-seo.pvdata.host:8080",
+      "http://g2rTXpNfPdcw2fzGtWKp62yH:nizar1elad2@mt-qor.pvdata.host:8080",
+      "http://g2rTXpNfPdcw2fzGtWKp62yH:nizar1elad2@md-chi.pvdata.host:8080",
+      "http://g2rTXpNfPdcw2fzGtWKp62yH:nizar1elad2@se-sto.pvdata.host:8080",
+      "http://g2rTXpNfPdcw2fzGtWKp62yH:nizar1elad2@my-kua.pvdata.host:8080",
+      "http://g2rTXpNfPdcw2fzGtWKp62yH:nizar1elad2@im-bal.pvdata.host:8080",
+      "http://g2rTXpNfPdcw2fzGtWKp62yH:nizar1elad2@it-mil.pvdata.host:8080",
+      "http://g2rTXpNfPdcw2fzGtWKp62yH:nizar1elad2@in-ban.pvdata.host:8080",
+      "http://g2rTXpNfPdcw2fzGtWKp62yH:nizar1elad2@de-ber.pvdata.host:8080",
+      "http://g2rTXpNfPdcw2fzGtWKp62yH:nizar1elad2@is-rey.pvdata.host:8080",
+      "http://g2rTXpNfPdcw2fzGtWKp62yH:nizar1elad2@de-fra.pvdata.host:8080",
+      "http://g2rTXpNfPdcw2fzGtWKp62yH:nizar1elad2@ca-van.pvdata.host:8080",
+      "http://g2rTXpNfPdcw2fzGtWKp62yH:nizar1elad2@at-wie.pvdata.host:8080",
+      "http://g2rTXpNfPdcw2fzGtWKp62yH:nizar1elad2@cy-lim.pvdata.host:8080",
+      "http://g2rTXpNfPdcw2fzGtWKp62yH:nizar1elad2@ca-mon.pvdata.host:8080",
+      "http://g2rTXpNfPdcw2fzGtWKp62yH:nizar1elad2@au-bri.pvdata.host:8080",
+      "http://naveed:Qwerty_123ABC@103.204.108.142:12345",
+      "http://g2rTXpNfPdcw2fzGtWKp62yH:nizar1elad2@ph-man.pvdata.host:8080",
+      "http://g2rTXpNfPdcw2fzGtWKp62yH:nizar1elad2@nz-auc.pvdata.host:8080",
+      "http://g2rTXpNfPdcw2fzGtWKp62yH:nizar1elad2@rs-bel.pvdata.host:8080"
+    ],
+    "stats": {
+      "total_checked": 2,
+      "total_charged": 0,
+      "total_approved": 0,
+      "total_declined": 0,
+      "total_charged_amt": 0
+    },
+    "credits": 0,
+    "username": "aldorsi",
+    "daily_count": 2,
+    "daily_date": "2026-07-16",
+    "unlimited_until": 0
+  }
+}

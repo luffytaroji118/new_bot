@@ -1,0 +1,11 @@
+razorpay-solver/
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+data/
+.env
+again.exe
+bot.exe
