@@ -701,9 +701,10 @@ func processRazorpayPayment(card, cc, mm, yy, cvv string, md *razorpayMerchantDa
 	}
 
 	// ── 3DS redirect path (browser-based) ──
-	// Run solver and cancel in parallel. Whichever gives a definitive
-	// answer first wins. Most declined cards get the cancel result in
-	// ~2s without waiting for the full 8-10s solver cycle.
+	// Run solver and cancel in parallel. After both complete, do a status
+	// check — that's how charged cards are actually detected (the browser
+	// page rarely shows "razorpay_signature", but the API status will say
+	// "captured" or "authorized" if the payment went through frictionless).
 	fmt.Printf("[RAZ] card=%s step=3ds_browser redirect_url=%s\n", card, redirectURL)
 
 	type solverOutcome struct {
@@ -723,38 +724,52 @@ func processRazorpayPayment(card, cc, mm, yy, cvv string, md *razorpayMerchantDa
 		cancelCh <- cancelOutcome{data: cancelPayment(client, md, sessionToken, paymentID)}
 	}()
 
-	// Wait for either solver or cancel to give a definitive answer
-	for {
-		select {
-		case so := <-solverCh:
-			if so.result != nil && so.result.Charged {
-				fmt.Printf("[RAZ] card=%s step=3ds_result CHARGED (frictionless)\n", card)
-				return &CheckResult{Card: card, Status: StatusCharged, StatusCode: "PAYMENT_SUCCEEDED", Amount: amtStr, Currency: "INR", Gateway: razorpayGatewayName}
-			}
-			// Solver not charged — wait for cancel
-			co := <-cancelCh
-			rawCancel, _ := json.Marshal(co.data)
-			fmt.Printf("[RAZ] card=%s step=cancel response=%s\n", card, string(rawCancel))
-			tag, reason := determineTagFromCancel(co.data)
-			return buildCancelResult(card, amtStr, tag, reason)
-
-		case co := <-cancelCh:
-			rawCancel, _ := json.Marshal(co.data)
-			fmt.Printf("[RAZ] card=%s step=cancel response=%s\n", card, string(rawCancel))
-			tag, reason := determineTagFromCancel(co.data)
-			// If cancel gives a definitive DECLINED, return immediately
-			if tag == "DECLINED" {
-				return buildCancelResult(card, amtStr, tag, reason)
-			}
-			// Otherwise wait for solver to check if charged
-			so := <-solverCh
-			if so.result != nil && so.result.Charged {
-				fmt.Printf("[RAZ] card=%s step=3ds_result CHARGED (frictionless)\n", card)
-				return &CheckResult{Card: card, Status: StatusCharged, StatusCode: "PAYMENT_SUCCEEDED", Amount: amtStr, Currency: "INR", Gateway: razorpayGatewayName}
-			}
-			return buildCancelResult(card, amtStr, tag, reason)
-		}
+	// Wait for solver
+	so := <-solverCh
+	if so.result != nil && so.result.Charged {
+		fmt.Printf("[RAZ] card=%s step=3ds_result CHARGED (frictionless)\n", card)
+		return &CheckResult{Card: card, Status: StatusCharged, StatusCode: "PAYMENT_SUCCEEDED", Amount: amtStr, Currency: "INR", Gateway: razorpayGatewayName}
 	}
+
+	// Wait for cancel
+	co := <-cancelCh
+	rawCancel, _ := json.Marshal(co.data)
+	fmt.Printf("[RAZ] card=%s step=cancel response=%s\n", card, string(rawCancel))
+	tag, reason := determineTagFromCancel(co.data)
+
+	// If cancel gives a definitive DECLINED, return immediately
+	if tag == "DECLINED" {
+		return buildCancelResult(card, amtStr, tag, reason)
+	}
+
+	// Status check — this is how charged cards are actually detected.
+	// The browser may not show "razorpay_signature" but the API status
+	// will say "captured" or "authorized" if frictionless 3DS approved it.
+	time.Sleep(1 * time.Second)
+	finalStatus, statusData := checkPaymentStatus(client, md, sessionToken, paymentID)
+	fmt.Printf("[RAZ] card=%s step=status_check status=%s\n", card, finalStatus)
+
+	if finalStatus == "captured" || finalStatus == "authorized" {
+		return &CheckResult{Card: card, Status: StatusCharged, StatusCode: "PAYMENT_SUCCEEDED", Amount: amtStr, Currency: "INR", Gateway: razorpayGatewayName}
+	}
+
+	if finalStatus == "failed" {
+		errDesc := ""
+		if ed, ok := statusData["error_description"].(string); ok && ed != "" {
+			errDesc = ed
+		}
+		if errObj, ok := statusData["error"].(map[string]interface{}); ok {
+			if d, ok := errObj["description"].(string); ok && d != "" {
+				errDesc = d
+			}
+		}
+		if errDesc == "" {
+			errDesc = "Payment failed"
+		}
+		return &CheckResult{Card: card, Status: StatusDeclined, StatusCode: "DECLINED > " + strings.ToUpper(errDesc), Gateway: razorpayGatewayName}
+	}
+
+	return buildCancelResult(card, amtStr, tag, reason)
 }
 
 func buildCancelResult(card, amtStr, tag, reason string) *CheckResult {
