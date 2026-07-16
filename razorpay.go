@@ -541,7 +541,7 @@ func determineTagFromCancel(cancelData map[string]interface{}) (string, string) 
 		"incorrect_pin": true, "insufficient_funds": true, "processing_error": true,
 		"invalid_cvv": true, "bank_technical_error": true, "gateway_error": true,
 		"bad_request": true, "authentication_failed": true, "timeout": true,
-		"do_not_honour": true,
+		"do_not_honour": true, "payment_risk_check_failed": true,
 	}
 	if declineReasons[reason] {
 		return "DECLINED", reason
