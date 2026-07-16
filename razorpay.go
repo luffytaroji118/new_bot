@@ -167,6 +167,7 @@ func fetchSessionToken(proxyURL string) (string, error) {
 
 		resp, err := client.Do(req)
 		if err != nil {
+			fmt.Printf("[RAZ] session_token url=%s err=%v proxy=%s\n", u, err, proxyURL)
 			continue
 		}
 
@@ -196,6 +197,8 @@ func fetchSessionToken(proxyURL string) (string, error) {
 				return token, nil
 			}
 		}
+
+		fmt.Printf("[RAZ] session_token url=%s status=%d body_len=%d no_token_found\n", u, resp.StatusCode, len(body))
 	}
 
 	return "", fmt.Errorf("all token methods failed")
