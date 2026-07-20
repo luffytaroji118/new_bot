@@ -736,10 +736,10 @@ func processRazorpayPayment(card, cc, mm, yy, cvv string, md *razorpayMerchantDa
 	}
 
 	// ── 3DS redirect path (browser-based) ──
-	// Flow: solver (browser) → check status → cancel (classifies the card).
-	// For frictionless cards, the bank approves silently backend-to-backend.
-	// The browser may fail to load the bank page (proxy/SSL), but the payment
-	// status will still show captured/authorized. This is how v4 does it.
+	// Flow: solver (browser) → cancel (classifies the card).
+	// The solver runs without proxy (bank 3DS domains fail through proxy
+	// with ERR_TUNNEL_CONNECTION_FAILED). For frictionless cards, the bank
+	// approves silently and the solver detects razorpay_signature.
 	fmt.Printf("[RAZ] card=%s step=3ds_browser redirect_url=%s\n", card, redirectURL)
 
 	// Step 1: Run solver — gives the browser time to follow the 3DS
@@ -754,7 +754,6 @@ func processRazorpayPayment(card, cc, mm, yy, cvv string, md *razorpayMerchantDa
 	// Step 2: Check payment status. For frictionless cards, the 3DS auth
 	// happens backend-to-backend (Razorpay ↔ Bank) even if the browser
 	// couldn't load the bank page. The payment may already be captured.
-	time.Sleep(1 * time.Second)
 	status, statusData := checkPaymentStatus(client, md, sessionToken, paymentID)
 	fmt.Printf("[RAZ] card=%s step=status_check status=%s\n", card, status)
 
