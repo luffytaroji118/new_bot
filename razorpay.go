@@ -736,9 +736,10 @@ func processRazorpayPayment(card, cc, mm, yy, cvv string, md *razorpayMerchantDa
 	}
 
 	// ── 3DS redirect path (browser-based) ──
-	// Flow: solver (browser) → cancel (classifies the card).
-	// The status check endpoint requires API key auth (returns 401 with
-	// session_token), so we skip it and rely on cancel + solver page_text.
+	// Flow: solver (browser) → check status → cancel (classifies the card).
+	// For frictionless cards, the bank approves silently backend-to-backend.
+	// The browser may fail to load the bank page (proxy/SSL), but the payment
+	// status will still show captured/authorized. This is how v4 does it.
 	fmt.Printf("[RAZ] card=%s step=3ds_browser redirect_url=%s\n", card, redirectURL)
 
 	// Step 1: Run solver — gives the browser time to follow the 3DS
@@ -750,7 +751,42 @@ func processRazorpayPayment(card, cc, mm, yy, cvv string, md *razorpayMerchantDa
 		return &CheckResult{Card: card, Status: StatusCharged, StatusCode: "PAYMENT_SUCCEEDED", Amount: amtStr, Currency: "INR", Gateway: razorpayGatewayName}
 	}
 
-	// Step 2: Cancel the payment to classify it.
+	// Step 2: Check payment status. For frictionless cards, the 3DS auth
+	// happens backend-to-backend (Razorpay ↔ Bank) even if the browser
+	// couldn't load the bank page. The payment may already be captured.
+	time.Sleep(1 * time.Second)
+	status, statusData := checkPaymentStatus(client, md, sessionToken, paymentID)
+	fmt.Printf("[RAZ] card=%s step=status_check status=%s\n", card, status)
+
+	if status == "captured" || status == "authorized" {
+		fmt.Printf("[RAZ] card=%s step=status CHARGED (status=%s)\n", card, status)
+		return &CheckResult{Card: card, Status: StatusCharged, StatusCode: "PAYMENT_SUCCEEDED", Amount: amtStr, Currency: "INR", Gateway: razorpayGatewayName}
+	}
+
+	if status == "failed" {
+		errDesc := ""
+		if errObj, ok := statusData["error"].(map[string]interface{}); ok {
+			if d, ok := errObj["description"].(string); ok {
+				errDesc = d
+			}
+		}
+		if errDesc == "" {
+			if d, ok := statusData["error_description"].(string); ok {
+				errDesc = d
+			}
+		}
+		if errDesc == "" {
+			errDesc = "Payment failed"
+		}
+		reasonStr := "payment_failed"
+		if r, ok := statusData["reason"].(string); ok && r != "" {
+			reasonStr = r
+		}
+		fmt.Printf("[RAZ] card=%s step=status DECLINED (desc=%s)\n", card, errDesc)
+		return &CheckResult{Card: card, Status: StatusDeclined, StatusCode: "DECLINED > " + strings.ToUpper(reasonStr), Gateway: razorpayGatewayName}
+	}
+
+	// Step 3: Cancel the payment to classify it.
 	cancelData := cancelPayment(client, md, sessionToken, paymentID)
 	rawCancel, _ := json.Marshal(cancelData)
 	fmt.Printf("[RAZ] card=%s step=cancel response=%s\n", card, string(rawCancel))
