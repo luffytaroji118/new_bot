@@ -81,9 +81,10 @@ func handle3DSRedirect(redirectURL, proxyURL string) *razorpay3DSResult {
 			idx := (startIdx + i) % len(solverURLs)
 			result, busy := solveViaHTTP(solverURLs[idx], redirectURL, proxyURL)
 			if result != nil {
-				if result.PageText == "" && !result.PageClosedEarly && !result.Charged {
-					continue
-				}
+				// Don't retry on empty results - if the first solver couldn't
+				// load the bank page through the proxy, the others won't either
+				// (same proxy, same ERR_TUNNEL_CONNECTION_FAILED). Return the
+				// result and let the bot's status check handle classification.
 				if strings.Contains(strings.ToLower(result.PageText), "403 forbidden") {
 					fmt.Printf("[RAZ] solver %s got 403, trying next\n", solverURLs[idx])
 					continue
