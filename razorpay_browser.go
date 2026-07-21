@@ -19,11 +19,12 @@ import (
 
 // razorpay3DSResult holds the result of the browser-based 3DS handling.
 type razorpay3DSResult struct {
-	PageText           string
-	PageClosedEarly    bool
-	Charged            bool
-	Bank3DS            bool
-	PaymentInProgress  bool
+	PageText          string
+	PageClosedEarly   bool
+	Charged           bool
+	Bank3DS           bool
+	PaymentInProgress bool
+	SolverRan         bool // true if the solver actually ran (not 503/all-busy)
 }
 
 // solverRequest is the JSON body sent to the solver service.
@@ -195,6 +196,7 @@ func solveViaHTTP(solverURL, redirectURL, proxyURL string) (*razorpay3DSResult, 
 		Charged:           sr.Charged,
 		Bank3DS:           sr.Bank3DS,
 		PaymentInProgress: sr.PaymentInProgress,
+		SolverRan:         true,
 	}
 
 	fmt.Printf("[RAZ] 3ds solver=%s charged=%v bank_3ds=%v pip=%v closed_early=%v page_text_len=%d\n",
@@ -211,7 +213,7 @@ func solveViaHTTP(solverURL, redirectURL, proxyURL string) (*razorpay3DSResult, 
 
 // solveLocal runs a local headless Chrome instance to handle the 3DS redirect.
 func solveLocal(redirectURL, proxyURL string) *razorpay3DSResult {
-	result := &razorpay3DSResult{}
+	result := &razorpay3DSResult{SolverRan: true}
 
 	opts := append(chromedp.DefaultExecAllocatorOptions[:],
 		chromedp.Flag("headless", true),

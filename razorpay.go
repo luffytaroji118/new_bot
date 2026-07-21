@@ -536,6 +536,12 @@ func determineTagFromCancel(cancelData map[string]interface{}) (string, string) 
 		return "LIVE", "card_not_enrolled"
 	}
 
+	// Network/HTTP errors from the cancel call itself don't tell us
+	// anything about the card — treat as UNKNOWN (retryable).
+	if reason == "network_error" || reason == "http_error" {
+		return "UNKNOWN", reason
+	}
+
 	declineReasons := map[string]bool{
 		"invalid_card": true, "card_declined": true, "expired_card": true,
 		"incorrect_pin": true, "insufficient_funds": true, "processing_error": true,
@@ -556,10 +562,12 @@ func determineTagFromCancel(cancelData map[string]interface{}) (string, string) 
 	if strings.Contains(descLower, "cancelled") {
 		return "LIVE", "payment_cancelled"
 	}
-	if strings.Contains(descLower, "too many requests") {
+	if strings.Contains(descLower, "too many requests") || strings.Contains(descLower, "rate limit") {
 		return "UNKNOWN", "rate_limited"
 	}
-	return "LIVE", "unknown_live"
+	// Unknown reason — don't assume live. Treat as UNKNOWN so the caller
+	// can retry or fall back to status re-check.
+	return "UNKNOWN", "unknown"
 }
 
 // determineTagFromSolverPage classifies a card based on the solver's
@@ -774,7 +782,15 @@ func processRazorpayPayment(card, cc, mm, yy, cvv string, md *razorpayMerchantDa
 	// redirect chain. For frictionless cards, the bank approves silently.
 	solverResult := handle3DSRedirect(redirectURL, proxyURL)
 
-	if solverResult != nil && solverResult.Charged {
+	// If the solver never ran (all slots busy / 503), we have NO information
+	// about the card — the 3DS redirect was never followed, the bank never
+	// got the 3DS request. Return a retryable error instead of guessing.
+	if solverResult == nil || !solverResult.SolverRan {
+		fmt.Printf("[RAZ] card=%s step=solver_unavailable (all busy or HTTP error) → RETRY\n", card)
+		return &CheckResult{Card: card, Status: StatusError, StatusCode: "SOLVER_UNAVAILABLE", Gateway: razorpayGatewayName, Retryable: true}
+	}
+
+	if solverResult.Charged {
 		fmt.Printf("[RAZ] card=%s step=3ds_result CHARGED (frictionless)\n", card)
 		return &CheckResult{Card: card, Status: StatusCharged, StatusCode: "PAYMENT_SUCCEEDED", Amount: amtStr, Currency: "INR", Gateway: razorpayGatewayName}
 	}
@@ -783,7 +799,7 @@ func processRazorpayPayment(card, cc, mm, yy, cvv string, md *razorpayMerchantDa
 	// page). This means the card is LIVE and passed all checks; it just
 	// requires OTP. Treat as APPROVED immediately. Don't call cancel — we
 	// already know the card is good.
-	if solverResult != nil && solverResult.Bank3DS {
+	if solverResult.Bank3DS {
 		fmt.Printf("[RAZ] card=%s step=3ds_result BANK_3DS (challenge page detected → APPROVED)\n", card)
 		return &CheckResult{Card: card, Status: StatusApproved, StatusCode: "3DS_REQUIRED", Amount: amtStr, Currency: "INR", Gateway: razorpayGatewayName}
 	}
@@ -792,7 +808,7 @@ func processRazorpayPayment(card, cc, mm, yy, cvv string, md *razorpayMerchantDa
 	// page. The bank is doing backend 3DS; the result isn't visible in the
 	// browser. Retry the status API a few times with delays — the payment
 	// may transition to captured once the bank finishes.
-	if solverResult != nil && solverResult.PaymentInProgress {
+	if solverResult.PaymentInProgress {
 		fmt.Printf("[RAZ] card=%s step=3ds_result PAYMENT_IN_PROGRESS (retrying status API)\n", card)
 		for attempt := 1; attempt <= 4; attempt++ {
 			time.Sleep(3 * time.Second)
@@ -826,10 +842,9 @@ func processRazorpayPayment(card, cc, mm, yy, cvv string, md *razorpayMerchantDa
 			}
 			// status is "pending"/"created"/"attempted" — keep retrying
 		}
-		// Still in progress after 4 retries. Fall through to cancel to
-		// classify it. The cancel will likely return payment_cancelled →
-		// LIVE, which is the safe answer for a card still being processed.
-		fmt.Printf("[RAZ] card=%s step=pip_retry still pending after 4 attempts, falling through to cancel\n", card)
+		// Still in progress after 4 retries. Fall through to status check +
+		// cancel to classify it.
+		fmt.Printf("[RAZ] card=%s step=pip_retry still pending after 4 attempts, falling through\n", card)
 	}
 
 	// Step 2: Check payment status. For frictionless cards, the 3DS auth
@@ -872,13 +887,51 @@ func processRazorpayPayment(card, cc, mm, yy, cvv string, md *razorpayMerchantDa
 	fmt.Printf("[RAZ] card=%s step=cancel response=%s\n", card, string(rawCancel))
 	tag, reason := determineTagFromCancel(cancelData)
 
-	// If cancel was rate-limited, fall back to solver page_text analysis.
+	// If cancel was rate-limited or unknown, fall back to solver page_text.
 	if tag == "UNKNOWN" && solverResult != nil && solverResult.PageText != "" {
 		solverTag, solverReason := determineTagFromSolverPage(solverResult.PageText)
 		if solverTag != "UNKNOWN" {
 			fmt.Printf("[RAZ] card=%s step=solver_fallback tag=%s reason=%s\n", card, solverTag, solverReason)
 			tag, reason = solverTag, solverReason
 		}
+	}
+
+	// Critical: if cancel says payment_cancelled (LIVE), re-check the
+	// actual payment status. The bank may have declined DURING the solver
+	// wait — in that case the status is now "failed" and the card is dead.
+	// Only trust payment_cancelled as LIVE if the status confirms it's
+	// "cancelled" (we killed it) or still "pending" (bank didn't decline).
+	if tag == "LIVE" && reason == "payment_cancelled" {
+		time.Sleep(2 * time.Second)
+		postStatus, postStatusData := checkPaymentStatus(client, md, sessionToken, paymentID)
+		fmt.Printf("[RAZ] card=%s step=post_cancel_status status=%s\n", card, postStatus)
+
+		if postStatus == "captured" || postStatus == "authorized" {
+			fmt.Printf("[RAZ] card=%s step=post_cancel CHARGED (status=%s)\n", card, postStatus)
+			return &CheckResult{Card: card, Status: StatusCharged, StatusCode: "PAYMENT_SUCCEEDED", Amount: amtStr, Currency: "INR", Gateway: razorpayGatewayName}
+		}
+		if postStatus == "failed" {
+			errDesc := ""
+			if errObj, ok := postStatusData["error"].(map[string]interface{}); ok {
+				if d, ok := errObj["description"].(string); ok {
+					errDesc = d
+				}
+			}
+			if errDesc == "" {
+				errDesc = "Payment failed"
+			}
+			reasonStr := "payment_failed"
+			if r, ok := postStatusData["reason"].(string); ok && r != "" {
+				reasonStr = r
+			}
+			fmt.Printf("[RAZ] card=%s step=post_cancel DECLINED (bank declined during solver wait, desc=%s)\n", card, errDesc)
+			return &CheckResult{Card: card, Status: StatusDeclined, StatusCode: "DECLINED > " + strings.ToUpper(reasonStr), Gateway: razorpayGatewayName}
+		}
+		// Status is "cancelled" (we killed it, bank didn't decline) or
+		// still "pending" (bank didn't respond) — after 25s solver wait +
+		// 2s post-cancel wait, the bank had plenty of time to decline.
+		// If it didn't, the card is likely live.
+		fmt.Printf("[RAZ] card=%s step=post_cancel LIVE (status=%s, bank didn't decline → APPROVED)\n", card, postStatus)
 	}
 
 	return buildCancelResult(card, amtStr, tag, reason)
@@ -896,6 +949,8 @@ func buildCancelResult(card, amtStr, tag, reason string) *CheckResult {
 		}
 		return &CheckResult{Card: card, Status: StatusDeclined, StatusCode: "DECLINED > " + strings.ToUpper(reason), Gateway: razorpayGatewayName}
 	default:
-		return &CheckResult{Card: card, Status: StatusApproved, StatusCode: "3DS_REQUIRED", Gateway: razorpayGatewayName}
+		// Unknown — don't assume approved. Return retryable error so the
+		// card gets rechecked later instead of producing a false approved.
+		return &CheckResult{Card: card, Status: StatusError, StatusCode: "RETRY_" + strings.ToUpper(reason), Gateway: razorpayGatewayName, Retryable: true}
 	}
 }
