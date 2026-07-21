@@ -650,26 +650,63 @@ func checkRazorpayCard(cc, mm, yy, cvv, proxyURL string) *CheckResult {
 		}
 	}
 
-	// Step 1: Get cached session token
-	sessionToken, err := getCachedSessionToken(proxyURL)
-	if err != nil {
-		fmt.Printf("[RAZ] card=%s step=session_token err=%v\n", card, err)
-		return fail("SESSION_TOKEN_FAIL")
+	// Step 1: Get cached session token (with retry)
+	var sessionToken string
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(500+rand.Intn(500)) * time.Millisecond)
+		}
+		token, err := getCachedSessionToken(proxyURL)
+		if err == nil {
+			sessionToken = token
+			break
+		}
+		if attempt == 2 {
+			fmt.Printf("[RAZ] card=%s step=session_token err=%v (retries exhausted)\n", card, err)
+			return fail("SESSION_TOKEN_FAIL")
+		}
+		fmt.Printf("[RAZ] card=%s step=session_token retry=%d err=%v\n", card, attempt+1, err)
 	}
 
-	// Step 2: Get cached merchant data
-	md, err := getCachedMerchantData(proxyURL)
-	if err != nil {
-		fmt.Printf("[RAZ] card=%s step=merchant_data err=%v\n", card, err)
-		return fail("ALL_SITES_FAILED")
+	// Step 2: Get cached merchant data (with retry + cache invalidation)
+	var md *razorpayMerchantData
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			merchantDataMu.Lock()
+			cachedMerchantData = nil
+			merchantDataMu.Unlock()
+			time.Sleep(time.Duration(500+rand.Intn(500)) * time.Millisecond)
+		}
+		data, err := getCachedMerchantData(proxyURL)
+		if err == nil {
+			md = data
+			break
+		}
+		if attempt == 2 {
+			fmt.Printf("[RAZ] card=%s step=merchant_data err=%v (retries exhausted)\n", card, err)
+			return fail("ALL_SITES_FAILED")
+		}
+		fmt.Printf("[RAZ] card=%s step=merchant_data retry=%d err=%v\n", card, attempt+1, err)
 	}
 
-	// Step 3: Create order + process payment
-	client := newCookieClient(proxyURL, 30*time.Second)
-	orderID, err := createOrder(client, md)
-	if orderID == "" {
-		fmt.Printf("[RAZ] card=%s step=create_order failed err=%v\n", card, err)
-		return fail("ALL_SITES_FAILED")
+	// Step 3: Create order (with retry)
+	var orderID string
+	var client *http.Client
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(500+rand.Intn(500)) * time.Millisecond)
+		}
+		client = newCookieClient(proxyURL, 30*time.Second)
+		oid, err := createOrder(client, md)
+		if oid != "" {
+			orderID = oid
+			break
+		}
+		if attempt == 2 {
+			fmt.Printf("[RAZ] card=%s step=create_order failed err=%v (retries exhausted)\n", card, err)
+			return fail("ALL_SITES_FAILED")
+		}
+		fmt.Printf("[RAZ] card=%s step=create_order retry=%d err=%v\n", card, attempt+1, err)
 	}
 
 	return processRazorpayPayment(card, cc, mm, yy, cvv, md, sessionToken, orderID, client, proxyURL)
@@ -747,12 +784,23 @@ func processRazorpayPayment(card, cc, mm, yy, cvv string, md *razorpayMerchantDa
 		}
 	}
 
+	// OTP flow — card passed all checks, issuer requires OTP authentication.
+	// This is a LIVE card (3DS challenge). No need for solver or cancel.
+	if t, ok := pdata["type"].(string); ok && t == "otp" && paymentID != "" {
+		fmt.Printf("[RAZ] card=%s step=otp_challenge → APPROVED (OTP required, card is live)\n", card)
+		return &CheckResult{Card: card, Status: StatusApproved, StatusCode: "3DS_REQUIRED", Amount: amtStr, Currency: "INR", Gateway: razorpayGatewayName}
+	}
+
 	// Check for 3DS redirect
 	isRedirect := false
 	if r, ok := pdata["redirect"].(bool); ok && r {
 		isRedirect = true
 	}
 	if t, ok := pdata["type"].(string); ok && t == "redirect" {
+		isRedirect = true
+	}
+	// Some responses have "redirect" as a URL string, not a bool
+	if rStr, ok := pdata["redirect"].(string); ok && rStr != "" {
 		isRedirect = true
 	}
 
@@ -765,7 +813,17 @@ func processRazorpayPayment(card, cc, mm, yy, cvv string, md *razorpayMerchantDa
 	// Extract the redirect URL from the response
 	redirectURL := ""
 	if reqObj, ok := pdata["request"].(map[string]interface{}); ok {
-		redirectURL, _ = reqObj["url"].(string)
+		u, _ := reqObj["url"].(string)
+		// For OTP flows, request.url may be the OTP submit endpoint (POST),
+		// not a navigable URL. Use the "redirect" field instead.
+		if u != "" && !strings.Contains(u, "otp_submit") {
+			redirectURL = u
+		}
+	}
+	if redirectURL == "" {
+		if rStr, ok := pdata["redirect"].(string); ok && strings.HasPrefix(rStr, "http") {
+			redirectURL = rStr
+		}
 	}
 	if redirectURL == "" {
 		return &CheckResult{Card: card, Status: StatusDeclined, StatusCode: "REDIRECT_URL_MISSING", Gateway: razorpayGatewayName}
