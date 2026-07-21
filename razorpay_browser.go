@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -18,9 +19,11 @@ import (
 
 // razorpay3DSResult holds the result of the browser-based 3DS handling.
 type razorpay3DSResult struct {
-	PageText        string
-	PageClosedEarly bool
-	Charged         bool
+	PageText           string
+	PageClosedEarly    bool
+	Charged            bool
+	Bank3DS            bool
+	PaymentInProgress  bool
 }
 
 // solverRequest is the JSON body sent to the solver service.
@@ -31,13 +34,36 @@ type solverRequest struct {
 
 // solverResponse is what the solver service returns.
 type solverResponse struct {
-	Charged     bool   `json:"charged"`
-	PageText    string `json:"page_text"`
-	ClosedEarly bool   `json:"closed_early"`
-	Error       string `json:"error,omitempty"`
+	Charged           bool   `json:"charged"`
+	Bank3DS           bool   `json:"bank_3ds"`
+	PaymentInProgress bool   `json:"payment_in_progress"`
+	PageText          string `json:"page_text"`
+	ClosedEarly       bool   `json:"closed_early"`
+	Error             string `json:"error,omitempty"`
 }
 
 var solverRoundRobin uint64
+
+// solverCallSem caps concurrent handle3DSRedirect calls so we don't spam the
+// solver service with 503s when 20+ cards hit the 3DS path at once. The cap
+// is 2 concurrent solver calls per configured solver URL.
+var solverCallSem = make(chan struct{}, 8)
+var solverCallSemOnce sync.Once
+
+func initSolverCallSem() {
+	solverCallSemOnce.Do(func() {
+		n := len(getSolverURLs())
+		if n == 0 {
+			n = 1
+		}
+		cap := n * 2
+		if cap > 8 {
+			cap = 8
+		}
+		// Replace the channel with the right capacity.
+		solverCallSem = make(chan struct{}, cap)
+	})
+}
 
 // getSolverURLs returns the list of solver service URLs from env vars.
 // Supports RAZORPAY_SOLVER_URLS (comma-separated) and RAZORPAY_SOLVER_URL (single).
@@ -71,6 +97,17 @@ func getSolverURLs() []string {
 // external solver service(s) with round-robin load balancing and failover.
 // Otherwise, it runs a local headless Chrome instance.
 func handle3DSRedirect(redirectURL, proxyURL string) *razorpay3DSResult {
+	initSolverCallSem()
+
+	// Block until a solver call slot is free. This prevents 20+ concurrent
+	// cards from spamming the solver with requests that all return 503.
+	// The solver itself also has a concurrency limit, but queuing on the
+	// bot side avoids the HTTP round-trip waste and lets the API-only steps
+	// (session token, order creation, payment submit) keep running in
+	// parallel for other cards.
+	solverCallSem <- struct{}{}
+	defer func() { <-solverCallSem }()
+
 	solverURLs := getSolverURLs()
 
 	if len(solverURLs) > 0 {
@@ -153,13 +190,15 @@ func solveViaHTTP(solverURL, redirectURL, proxyURL string) (*razorpay3DSResult, 
 	}
 
 	result := &razorpay3DSResult{
-		PageText:        sr.PageText,
-		PageClosedEarly: sr.ClosedEarly,
-		Charged:         sr.Charged,
+		PageText:          sr.PageText,
+		PageClosedEarly:   sr.ClosedEarly,
+		Charged:           sr.Charged,
+		Bank3DS:           sr.Bank3DS,
+		PaymentInProgress: sr.PaymentInProgress,
 	}
 
-	fmt.Printf("[RAZ] 3ds solver=%s charged=%v closed_early=%v page_text_len=%d\n",
-		solverURL, result.Charged, result.PageClosedEarly, len(result.PageText))
+	fmt.Printf("[RAZ] 3ds solver=%s charged=%v bank_3ds=%v pip=%v closed_early=%v page_text_len=%d\n",
+		solverURL, result.Charged, result.Bank3DS, result.PaymentInProgress, result.PageClosedEarly, len(result.PageText))
 	if result.PageText != "" {
 		fmt.Printf("[RAZ] 3ds solver page_text=%s\n", result.PageText)
 	}
@@ -259,50 +298,77 @@ func solveLocal(redirectURL, proxyURL string) *razorpay3DSResult {
 				pageText = strings.TrimSpace(pageText)
 				lowerText := strings.ToLower(pageText)
 
-				if pageText != "" {
-					if strings.Contains(lowerText, "razorpay_signature") ||
-						strings.Contains(lowerText, "payment successful") ||
-						strings.Contains(lowerText, "payment_success") ||
-						strings.Contains(lowerText, "payment succeeded") ||
-						strings.Contains(lowerText, "payment_done") {
-						result.Charged = true
-						result.PageText = pageText
-						if len(result.PageText) > 300 {
-							result.PageText = result.PageText[:300]
-						}
-						return nil
+			if pageText != "" {
+				if strings.Contains(lowerText, "razorpay_signature") ||
+					strings.Contains(lowerText, "payment successful") ||
+					strings.Contains(lowerText, "payment_success") ||
+					strings.Contains(lowerText, "payment succeeded") ||
+					strings.Contains(lowerText, "payment_done") {
+					result.Charged = true
+					result.PageText = pageText
+					if len(result.PageText) > 300 {
+						result.PageText = result.PageText[:300]
 					}
-					if strings.Contains(lowerText, "payment") && strings.Contains(lowerText, "failed") {
-						result.PageText = pageText
-						if len(result.PageText) > 300 {
-							result.PageText = result.PageText[:300]
-						}
-						return nil
-					}
-					if strings.Contains(lowerText, "transaction failed") ||
-						strings.Contains(lowerText, "authentication failed") ||
-						strings.Contains(lowerText, "access denied") {
-						result.PageText = pageText
-						if len(result.PageText) > 300 {
-							result.PageText = result.PageText[:300]
-						}
-						return nil
-					}
+					return nil
 				}
+				// Bank 3DS challenge page — card is LIVE, needs OTP.
+				if isBank3DSPageText(lowerText) || isBank3DSPageURL(currentURL) {
+					result.Bank3DS = true
+					result.PageText = pageText
+					if len(result.PageText) > 300 {
+						result.PageText = result.PageText[:300]
+					}
+					return nil
+				}
+				// "Payment in progress" — frictionless status polling page.
+				if isPaymentInProgressPageText(lowerText) {
+					result.PaymentInProgress = true
+					result.PageText = pageText
+					if len(result.PageText) > 300 {
+						result.PageText = result.PageText[:300]
+					}
+					// Don't return — keep polling, it may transition.
+				}
+				if strings.Contains(lowerText, "payment") && strings.Contains(lowerText, "failed") {
+					result.PageText = pageText
+					if len(result.PageText) > 300 {
+						result.PageText = result.PageText[:300]
+					}
+					return nil
+				}
+				if strings.Contains(lowerText, "transaction failed") ||
+					strings.Contains(lowerText, "authentication failed") ||
+					strings.Contains(lowerText, "access denied") {
+					result.PageText = pageText
+					if len(result.PageText) > 300 {
+						result.PageText = result.PageText[:300]
+					}
+					return nil
+				}
+			}
 
-				onPgRouter := strings.Contains(currentURL, "pg_router") || strings.Contains(currentURL, "authenticate")
-				if !onPgRouter && pageText != "" {
-					if !leftPgRouter {
-						leftPgRouter = true
-						leftPgRouterTime = time.Now()
+			// Fast path: bank 3DS URL detected even if body text is empty.
+			if isBank3DSPageURL(currentURL) {
+				result.Bank3DS = true
+				if result.PageText == "" {
+					result.PageText = currentURL
+				}
+				return nil
+			}
+
+			onPgRouter := strings.Contains(currentURL, "pg_router") || strings.Contains(currentURL, "authenticate")
+			if !onPgRouter && pageText != "" {
+				if !leftPgRouter {
+					leftPgRouter = true
+					leftPgRouterTime = time.Now()
+				}
+				if time.Since(leftPgRouterTime) > 3*time.Second {
+					result.PageText = pageText
+					if len(result.PageText) > 300 {
+						result.PageText = result.PageText[:300]
 					}
-					if time.Since(leftPgRouterTime) > 3*time.Second {
-						result.PageText = pageText
-						if len(result.PageText) > 300 {
-							result.PageText = result.PageText[:300]
-						}
-						return nil
-					}
+					return nil
+				}
 				}
 
 				time.Sleep(500 * time.Millisecond)
@@ -373,4 +439,83 @@ func fileExists(path string) bool {
 	}
 	_, err := os.Stat(path)
 	return err == nil
+}
+
+// bank3DSURLPatterns lists issuer/ACS URL substrings that indicate a 3DS
+// challenge page has loaded. Mirrors the solver's BANK_3DS_URL_PATTERNS.
+var bank3DSURLPatterns = []string{
+	"arcot.com", "m2pfintech.com", "uobgroup.com",
+	"hdfcbank.com", "icicibank.com", "sbicard.com",
+	"axisbank.co.in", "axisbank.com",
+	"3dsecure", "acs.", "acs1.", "acs2.", "acs3.", "acs-",
+	"mastercard.com", "visa.com", "verifiedbyvisa",
+	"mastercardsecurecode", "bankofbaroda", "kotak",
+	"idbibank", "yesbank", "federalbank", "citisfhh",
+	"canarabank", "pnb.co.in", "unionbankofindia",
+	"indianbank", "bankofindia", "centralbankofindia",
+	"rupeepay", "rupay.in", "billdesk", "atomtech",
+	"techprocess", "easypay", "bharatbillpay",
+}
+
+// bank3DSTextPatterns lists page body text substrings that indicate a 3DS
+// challenge page. Mirrors the solver's BANK_3DS_TEXT_PATTERNS.
+var bank3DSTextPatterns = []string{
+	"verify your purchase", "transaction verification",
+	"we have sent the secure online code", "we have sent the secure code",
+	"getting your verification method", "enter otp", "enter the otp",
+	"one time password", "one-time password", "secure online",
+	"3d secure", "3ds authentication", "mastercard securecode",
+	"verified by visa", "verified by mastercard",
+	"please enter the otp", "secure online shopping",
+	"cardholder authentication", "verify your identity",
+	"authentication required", "secure payment system",
+	"pinnacle epg", "enroll for 3d secure", "3-secure",
+	"threedsecure", "payer authentication", "acs challenge",
+	"bank's verification",
+}
+
+// paymentInProgressTextPatterns lists page body text substrings that indicate
+// Razorpay's frictionless "Payment in progress" status-polling page.
+var paymentInProgressTextPatterns = []string{
+	"payment in progress", "payment is being processed",
+	"processing your payment", "please wait while we process",
+	"don't refresh the page", "we are processing your payment",
+	"please wait... completing payment",
+}
+
+func isBank3DSPageURL(rawURL string) bool {
+	if rawURL == "" {
+		return false
+	}
+	low := strings.ToLower(rawURL)
+	for _, p := range bank3DSURLPatterns {
+		if strings.Contains(low, p) {
+			return true
+		}
+	}
+	return false
+}
+
+func isBank3DSPageText(lowerText string) bool {
+	if lowerText == "" {
+		return false
+	}
+	for _, p := range bank3DSTextPatterns {
+		if strings.Contains(lowerText, p) {
+			return true
+		}
+	}
+	return false
+}
+
+func isPaymentInProgressPageText(lowerText string) bool {
+	if lowerText == "" {
+		return false
+	}
+	for _, p := range paymentInProgressTextPatterns {
+		if strings.Contains(lowerText, p) {
+			return true
+		}
+	}
+	return false
 }

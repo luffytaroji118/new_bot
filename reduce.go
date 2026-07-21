@@ -654,16 +654,16 @@ func runCheckoutForCard(shopURL, cardEntry, proxyURL string) (*CheckResult, erro
 				errorCode = "FAILED"
 			}
 
-			switch errorCode {
-			case "INSUFFICIENT_FUNDS":
-				result.Status = StatusApproved
-				result.StatusCode = errorCode
-				return result, nil
-			case "CAPTCHA_REQUIRED":
-				result.Status = StatusDeclined
-				result.StatusCode = "CARD_DECLINED"
-				result.Error = fmt.Errorf("declined: CARD_DECLINED")
-				return result, result.Error
+		switch errorCode {
+		case "INSUFFICIENT_FUNDS":
+			result.Status = StatusApproved
+			result.StatusCode = errorCode
+			return result, nil
+		case "CAPTCHA_REQUIRED":
+			result.Status = StatusDeclined
+			result.StatusCode = "CARD_DECLINED"
+			result.Error = fmt.Errorf("declined: CARD_DECLINED")
+			return result, result.Error
 			case "GENERIC_ERROR":
 				result.Status = StatusDeclined
 				result.StatusCode = errorCode
