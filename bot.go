@@ -27,7 +27,7 @@ import (
 )
 
 
-const botToken = "8926197260:AAHIYcobu0qPP7VQ6wOQa-r_7RAkUDXCCzU"
+const botToken = "8708570332:AAEP1_RWcbq5uJzJtadqkS_5QCPjr16CSnc"
 const logsGroupID = -1002798580895
 var usersFile = "users.json"
 var configFile = "botconfig.json"
